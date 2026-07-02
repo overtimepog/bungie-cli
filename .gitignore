@@ -1,0 +1,18 @@
+# secrets & personal account data
+bungie_secrets.py
+token.json
+.env
+
+# personal output
+dismantle_list.csv
+vault_run.log
+
+# generated manifest caches (large; rebuilt on first run)
+manifest_items.json
+manifest_index.json
+collectibles.json
+sources.json
+
+# python
+__pycache__/
+*.pyc

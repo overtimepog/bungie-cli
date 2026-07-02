@@ -1,0 +1,2 @@
+requests
+cryptography  # optional: enables the one-click localhost login capture
