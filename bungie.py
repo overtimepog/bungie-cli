@@ -33,6 +33,9 @@ Commands:
                               call ANY /Platform endpoint (covers the whole API)
   selftest                    offline checks, no network
 
+Read commands (whoami, chars, inv, item, source, postmaster, godrolls) take
+--json for machine-readable output an agent can parse.
+
 Per-command help: python bungie.py <command> -h
 """
 import argparse, json, os, sys, time, webbrowser
@@ -398,10 +401,17 @@ def set_lock(token, mtype, char, iid, state):
         {"state": state, "itemId": iid, "characterId": char, "membershipType": mtype})
 
 
+def _perk_list(defs, hashes):
+    return [defs.get(str(h), {}).get("displayProperties", {}).get("name", "") or str(h) for h in hashes]
+
+
 def _perk_names(defs, hashes, cap=4):
-    names = [defs.get(str(h), {}).get("displayProperties", {}).get("name", "") for h in hashes]
-    names = [n for n in names if n]
+    names = [n for n in _perk_list(defs, hashes) if n]
     return ", ".join(names[:cap]) + (" ..." if len(names) > cap else "")
+
+
+def _emit(data):
+    print(json.dumps(data, indent=2, default=str))
 
 
 # ===== commands =========================================================
@@ -414,18 +424,32 @@ def cmd_whoami(a):
     token = get_token()
     me = api("/User/GetMembershipsForCurrentUser/", token)
     u  = me.get("bungieNetUser", {})
-    print(f"{u.get('uniqueName', u.get('displayName','?'))}  (membershipId {u.get('membershipId','?')})")
-    for m in me["destinyMemberships"]:
-        star = " *primary" if str(m["membershipId"]) == str(me.get("primaryMembershipId")) else ""
-        print(f"  type {m['membershipType']}  id {m['membershipId']}  {m.get('displayName','')}{star}")
+    prim = str(me.get("primaryMembershipId"))
+    data = {"name": u.get("uniqueName", u.get("displayName")),
+            "membershipId": u.get("membershipId"),
+            "memberships": [{"type": m["membershipType"], "id": m["membershipId"],
+                             "displayName": m.get("displayName"),
+                             "primary": str(m["membershipId"]) == prim}
+                            for m in me["destinyMemberships"]]}
+    if a.json:
+        return _emit(data)
+    print(f"{data['name']}  (membershipId {data['membershipId']})")
+    for m in data["memberships"]:
+        print(f"  type {m['type']}  id {m['id']}  {m['displayName'] or ''}{' *primary' if m['primary'] else ''}")
 
 
 def cmd_chars(a):
     token = get_token()
     mtype, mid = membership(token)
-    for cid, c in characters(token, mtype, mid).items():
-        print(f"{cid}  {CLASSES.get(c['classType'],'?'):7}  light {c.get('light','?'):>4}  "
-              f"{int(c.get('minutesPlayedTotal',0))//60}h played  last {c.get('dateLastPlayed','')[:10]}")
+    data = [{"id": cid, "class": CLASSES.get(c["classType"], "?"), "light": c.get("light"),
+             "minutesPlayed": int(c.get("minutesPlayedTotal", 0)),
+             "lastPlayed": c.get("dateLastPlayed", "")[:10]}
+            for cid, c in characters(token, mtype, mid).items()]
+    if a.json:
+        return _emit(data)
+    for c in data:
+        print(f"{c['id']}  {c['class']:7}  light {c['light']:>4}  "
+              f"{c['minutesPlayed']//60}h played  last {c['lastPlayed']}")
 
 
 def cmd_inv(a):
@@ -446,19 +470,26 @@ def cmd_inv(a):
         if a.type == "weapon" and info["type"] != WEAPON: continue
         if a.type == "armor"  and info["type"] != ARMOR:  continue
         if a.search and a.search.lower() not in info["name"].lower(): continue
-        d     = inst.get(iid, {})
-        rows.append((info["name"], d.get("itemLevel", 0), d.get("gearTier", 0),
-                     TIERS.get(info["tier"], "?"),
-                     "vault" if owner == "vault" else owner[-6:], iid))
-    rows.sort(key=lambda r: (-r[1], r[0]))
-    for name, level, gt, tier, loc, iid in rows:
-        print(f"T{gt} L{level:<3}  {tier:9}  {name:38.38}  {loc:>6}  {iid}")
+        d = inst.get(iid, {})
+        rows.append({"name": info["name"], "hash": it["itemHash"], "instanceId": iid,
+                     "level": d.get("itemLevel", 0), "gearTier": d.get("gearTier", 0),
+                     "rarity": TIERS.get(info["tier"], "?"),
+                     "location": "vault" if owner == "vault" else owner})
+    rows.sort(key=lambda r: (-r["level"], r["name"]))
+    if a.json:
+        return _emit(rows)
+    for r in rows:
+        loc = "vault" if r["location"] == "vault" else r["location"][-6:]
+        print(f"T{r['gearTier']} L{r['level']:<3}  {r['rarity']:9}  {r['name']:38.38}  {loc:>6}  {r['instanceId']}")
     print(f"\n{len(rows)} items")
 
 
 def cmd_item(a):
     idx = index()
     hits = search_defs(idx, a.query, a.n)
+    if a.json:
+        return _emit([{"hash": h, "name": v["name"], "type": v["type"],
+                       "rarity": TIERS.get(v["tier"], "?")} for h, v in hits])
     for h, v in hits:
         print(f"{h:>12}  {TIERS.get(v['tier'],'?'):9}  type {v['type']:>2}  {v['name']}")
     if not hits:
@@ -472,7 +503,10 @@ def cmd_source(a):
         s = srcs.get(h, "")
         if v["name"] not in seen or (s and not seen[v["name"]]):
             seen[v["name"]] = s
-    for name, s in list(seen.items())[:a.n]:
+    picked = list(seen.items())[:a.n]
+    if a.json:
+        return _emit([{"name": name, "source": s or None} for name, s in picked])
+    for name, s in picked:
         print(f"{name:28.28}  {s or '(no collectible source - world drop / vendor)'}")
     if not seen:
         print("no match")
@@ -524,21 +558,28 @@ def cmd_postmaster(a):
         api("/Destiny2/Actions/Items/PullFromPostmaster/", token, "POST",
             {"itemReferenceHash": ih, "stackSize": a.count, "itemId": a.pull,
              "characterId": owner, "membershipType": mtype})
-        return print(f"pulled {a.pull}")
+        return _emit({"pulled": a.pull}) if a.json else print(f"pulled {a.pull}")
     items, _ = all_items(token, mtype, mid, comps="201,300")
+    data = []
     for it, owner in items:
         if it.get("bucketHash") != POST_B:            continue
         if a.char and owner != a.char:                continue
         info = idx.get(str(it["itemHash"]), {"name": f"hash {it['itemHash']}"})
-        print(f"{owner[-6:]}  x{it.get('quantity',1):<3}  {info['name']:38.38}  {it.get('itemInstanceId','-')}")
+        data.append({"owner": owner, "name": info["name"], "quantity": it.get("quantity", 1),
+                     "instanceId": it.get("itemInstanceId")})
+    if a.json:
+        return _emit(data)
+    for d in data:
+        print(f"{d['owner'][-6:]}  x{d['quantity']:<3}  {d['name']:38.38}  {d['instanceId'] or '-'}")
 
 
 def cmd_godrolls(a):
     token = get_token()
     wl    = load_wishlist(a.wishlist)
-    print(f"wishlist: {len(wl)} entries")
+    if not a.json:
+        print(f"wishlist: {len(wl)} entries")
     defs  = load_manifest()
-    srcs  = sources() if a.source else {}
+    srcs  = sources() if (a.source or a.json) else {}
     items, _, _ = build_inventory(token, defs)
     guns  = [it for it in items if it["itemType"] == WEAPON
              and (not a.search or a.search.lower() in it["name"].lower())]
@@ -546,28 +587,43 @@ def cmd_godrolls(a):
     for it in guns:
         byhash[it["hash"]].append(it)
 
-    hits = miss = 0
+    data = []
     for h, grp in sorted(byhash.items(), key=lambda kv: kv[1][0]["name"].lower()):
-        name    = grp[0]["name"]
-        matched = [(it, matched_set(it, wl)) for it in grp]
-        good    = [(it, req) for it, req in matched if req is not None or it.get("crafted")]
+        name = grp[0]["name"]
+        good = [(it, req) for it, req in ((it, matched_set(it, wl)) for it in grp)
+                if req is not None or it.get("crafted")]
+        src  = srcs.get(str(h))
         if a.missing:
             if good or h not in wl:
                 continue
-            wants = " | ".join(_perk_names(defs, s) for s in wl[h][:3] if s) or "(any roll)"
-            src   = f"\n   [{srcs[str(h)]}]" if a.source and str(h) in srcs else ""
-            print(f"{name:34.34} x{len(grp)}{src}\n   wants: {wants}")
-            miss += 1
-            continue
-        if not good:
-            continue
-        src = f"   [{srcs[str(h)]}]" if a.source and str(h) in srcs else ""
-        print(f"{name:34.34} x{len(grp)} owned, {len(good)} god roll{src}")
-        for it, req in good:
-            tag  = "crafted" if (it.get("crafted") and req is None) else _perk_names(defs, req or [])
-            print(f"   T{it['gearTier']} L{it['level']:<3}  {it['location']:>5}  {it['instanceId']}  {tag}")
-            hits += 1
-    print(f"\n{'missing ' + str(miss) if a.missing else str(hits) + ' god-roll instances'}")
+            data.append({"name": name, "hash": h, "owned": len(grp), "source": src,
+                         "wants": [_perk_list(defs, s) for s in wl[h] if s]})
+        else:
+            if not good:
+                continue
+            data.append({"name": name, "hash": h, "owned": len(grp), "godRolls": len(good), "source": src,
+                         "instances": [{"instanceId": it["instanceId"], "gearTier": it["gearTier"],
+                                        "level": it["level"], "location": it["location"],
+                                        "crafted": bool(it.get("crafted") and req is None),
+                                        "perks": _perk_list(defs, req or [])} for it, req in good]})
+    if a.json:
+        return _emit(data)
+
+    hits = 0
+    for d in data:
+        if a.missing:
+            srct  = f"\n   [{d['source']}]" if a.source and d["source"] else ""
+            wants = " | ".join(", ".join(w[:4]) for w in d["wants"][:3]) or "(any roll)"
+            print(f"{d['name']:34.34} x{d['owned']}{srct}\n   wants: {wants}")
+        else:
+            srct = f"   [{d['source']}]" if a.source and d["source"] else ""
+            print(f"{d['name']:34.34} x{d['owned']} owned, {d['godRolls']} god roll{srct}")
+            for ins in d["instances"]:
+                tag = "crafted" if ins["crafted"] else \
+                    ", ".join(ins["perks"][:4]) + (" ..." if len(ins["perks"]) > 4 else "")
+                print(f"   T{ins['gearTier']} L{ins['level']:<3}  {ins['location']:>5}  {ins['instanceId']}  {tag}")
+                hits += 1
+    print(f"\n{'missing ' + str(len(data)) if a.missing else str(hits) + ' god-roll instances'}")
 
 
 def cmd_vault(a):
@@ -664,19 +720,20 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("login").set_defaults(fn=cmd_login)
-    sub.add_parser("whoami").set_defaults(fn=cmd_whoami)
-    sub.add_parser("chars").set_defaults(fn=cmd_chars)
     sub.add_parser("selftest").set_defaults(fn=cmd_selftest)
+    p = sub.add_parser("whoami"); p.set_defaults(fn=cmd_whoami); p.add_argument("--json", action="store_true")
+    p = sub.add_parser("chars");  p.set_defaults(fn=cmd_chars);  p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("inv"); p.set_defaults(fn=cmd_inv)
     p.add_argument("--char"); p.add_argument("--vault", action="store_true")
     p.add_argument("--search"); p.add_argument("--type", choices=["weapon", "armor"])
+    p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("item"); p.set_defaults(fn=cmd_item)
-    p.add_argument("query"); p.add_argument("-n", type=int, default=15)
+    p.add_argument("query"); p.add_argument("-n", type=int, default=15); p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("source"); p.set_defaults(fn=cmd_source)
-    p.add_argument("query"); p.add_argument("-n", type=int, default=10)
+    p.add_argument("query"); p.add_argument("-n", type=int, default=10); p.add_argument("--json", action="store_true")
 
     for name, fn in (("lock", cmd_lock), ("unlock", cmd_unlock)):
         p = sub.add_parser(name); p.set_defaults(fn=fn); p.add_argument("instance")
@@ -690,10 +747,12 @@ def main():
 
     p = sub.add_parser("postmaster"); p.set_defaults(fn=cmd_postmaster)
     p.add_argument("--char"); p.add_argument("--pull"); p.add_argument("--count", type=int, default=1)
+    p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("godrolls"); p.set_defaults(fn=cmd_godrolls)
     p.add_argument("--wishlist", default=VOLTRON); p.add_argument("--search")
     p.add_argument("--missing", action="store_true"); p.add_argument("--source", action="store_true")
+    p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("vault"); p.set_defaults(fn=cmd_vault)
     p.add_argument("--wishlist", help="DIM voltron file/URL; enables the meta gate")
