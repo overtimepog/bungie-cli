@@ -33,8 +33,9 @@ Commands:
                               call ANY /Platform endpoint (covers the whole API)
   selftest                    offline checks, no network
 
-Read commands (whoami, chars, inv, item, source, postmaster, godrolls) take
---json for machine-readable output an agent can parse.
+Most commands take --json for machine-readable output an agent can parse:
+read commands emit their data, action commands (lock/unlock/transfer/equip/
+vault) emit a JSON ack of what changed.
 
 Per-command help: python bungie.py <command> -h
 """
@@ -512,16 +513,15 @@ def cmd_source(a):
         print("no match")
 
 
-def cmd_lock(a):
+def _lock_cmd(a, state):
     token = get_token(); mtype, mid = membership(token)
-    set_lock(token, mtype, first_char(token, mtype, mid), a.instance, True)
-    print(f"locked {a.instance}")
+    set_lock(token, mtype, first_char(token, mtype, mid), a.instance, state)
+    verb = "locked" if state else "unlocked"
+    _emit({verb: a.instance}) if a.json else print(f"{verb} {a.instance}")
 
 
-def cmd_unlock(a):
-    token = get_token(); mtype, mid = membership(token)
-    set_lock(token, mtype, first_char(token, mtype, mid), a.instance, False)
-    print(f"unlocked {a.instance}")
+def cmd_lock(a):   _lock_cmd(a, True)
+def cmd_unlock(a): _lock_cmd(a, False)
 
 
 def cmd_transfer(a):
@@ -530,14 +530,14 @@ def cmd_transfer(a):
     ih, owner = find_instance(token, mtype, mid, a.instance)
     if a.to == "vault":
         if owner == "vault":
-            return print("already in vault")
+            return _emit({"transferred": a.instance, "to": "vault", "noop": True}) if a.json else print("already in vault")
         cid, to_vault = owner, True
     else:
         cid, to_vault = a.char or first_char(token, mtype, mid), False
     api("/Destiny2/Actions/Items/TransferItem/", token, "POST",
         {"itemReferenceHash": ih, "stackSize": a.count, "transferToVault": to_vault,
          "itemId": a.instance, "characterId": cid, "membershipType": mtype})
-    print(f"transferred {a.instance} -> {a.to}")
+    _emit({"transferred": a.instance, "to": a.to}) if a.json else print(f"transferred {a.instance} -> {a.to}")
     # ponytail: char->char must hop through the vault; run twice if that's what you need.
 
 
@@ -546,7 +546,7 @@ def cmd_equip(a):
     mtype, _ = membership(token)
     api("/Destiny2/Actions/Items/EquipItem/", token, "POST",
         {"itemId": a.instance, "characterId": a.char, "membershipType": mtype})
-    print(f"equipped {a.instance} on {a.char}")
+    _emit({"equipped": a.instance, "char": a.char}) if a.json else print(f"equipped {a.instance} on {a.char}")
 
 
 def cmd_postmaster(a):
@@ -629,7 +629,7 @@ def cmd_godrolls(a):
 def cmd_vault(a):
     """Meta-only triage -> dismantle_list.csv; optionally lock every keeper."""
     wishlist = load_wishlist(a.wishlist) if a.wishlist else None
-    if wishlist is not None:
+    if wishlist is not None and not a.json:
         print(f"wishlist: {len(wishlist)} entries")
     token = get_token()
     defs  = load_manifest()
@@ -646,20 +646,32 @@ def cmd_vault(a):
             f.write(f"\"{it['name']}\",{t},{it['gearTier']},{it['level']},"
                     f"{it['total']},{it['location']},\"{it['reason']}\"\n")
 
-    print(f"\n{len(items)} instanced items  |  KEEP {len(keep)}  |  JUNK {len(junk)}")
-    print("wrote dismantle_list.csv")
+    result = {"total": len(items), "keep": len(keep), "junk": len(junk), "csv": "dismantle_list.csv"}
+    if not a.json:
+        print(f"\n{len(items)} instanced items  |  KEEP {len(keep)}  |  JUNK {len(junk)}")
+        print("wrote dismantle_list.csv")
 
     if a.lock_keepers:
-        print(f"locking {len(keep)} keepers...")
+        failures = []
+        if not a.json:
+            print(f"locking {len(keep)} keepers...")
         for i, it in enumerate(keep, 1):
             try:
                 set_lock(token, mtype, it["owner"], it["instanceId"], True)
             except Exception as e:
-                print(f"  lock failed {it['name']}: {e}")
+                failures.append({"name": it["name"], "instanceId": it["instanceId"], "error": str(e)})
+                if not a.json:
+                    print(f"  lock failed {it['name']}: {e}")
             time.sleep(0.15)            # ponytail: fixed throttle; raise if Bungie 429s
-            if i % 25 == 0:
+            if not a.json and i % 25 == 0:
                 print(f"  {i}/{len(keep)}")
-        print("keepers locked. Now shard the dismantle_list safely.")
+        result["lockedKeepers"] = len(keep) - len(failures)
+        result["lockFailures"] = failures
+        if not a.json:
+            print("keepers locked. Now shard the dismantle_list safely.")
+
+    if a.json:
+        _emit(result)
 
 
 def cmd_raw(a):
@@ -736,14 +748,15 @@ def main():
     p.add_argument("query"); p.add_argument("-n", type=int, default=10); p.add_argument("--json", action="store_true")
 
     for name, fn in (("lock", cmd_lock), ("unlock", cmd_unlock)):
-        p = sub.add_parser(name); p.set_defaults(fn=fn); p.add_argument("instance")
+        p = sub.add_parser(name); p.set_defaults(fn=fn)
+        p.add_argument("instance"); p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("transfer"); p.set_defaults(fn=cmd_transfer)
     p.add_argument("instance"); p.add_argument("--to", choices=["vault", "char"], required=True)
-    p.add_argument("--char"); p.add_argument("--count", type=int, default=1)
+    p.add_argument("--char"); p.add_argument("--count", type=int, default=1); p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("equip"); p.set_defaults(fn=cmd_equip)
-    p.add_argument("instance"); p.add_argument("--char", required=True)
+    p.add_argument("instance"); p.add_argument("--char", required=True); p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("postmaster"); p.set_defaults(fn=cmd_postmaster)
     p.add_argument("--char"); p.add_argument("--pull"); p.add_argument("--count", type=int, default=1)
@@ -756,7 +769,7 @@ def main():
 
     p = sub.add_parser("vault"); p.set_defaults(fn=cmd_vault)
     p.add_argument("--wishlist", help="DIM voltron file/URL; enables the meta gate")
-    p.add_argument("--lock-keepers", action="store_true")
+    p.add_argument("--lock-keepers", action="store_true"); p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("raw"); p.set_defaults(fn=cmd_raw)
     p.add_argument("path"); p.add_argument("--post", action="store_true"); p.add_argument("--body")
