@@ -54,6 +54,68 @@ The escape hatch — any endpoint not wrapped as a subcommand is one command awa
 python bungie.py raw /Destiny2/Manifest/
 ```
 
+## JSON output (for agents)
+
+Most commands take `--json` for machine-readable output. Read commands emit their
+data; action commands (`lock`, `unlock`, `transfer`, `equip`, `vault`) emit a JSON
+ack of what changed. In JSON mode all progress/status lines are suppressed, so
+stdout is pure JSON you can pipe straight into a parser.
+
+```bash
+python bungie.py whoami --json
+```
+```json
+{
+  "name": "Guardian#1234",
+  "membershipId": "24705785",
+  "memberships": [
+    { "type": 3, "id": "4611686018499245344", "displayName": "Guardian", "primary": true }
+  ]
+}
+```
+
+```bash
+python bungie.py godrolls --search maahes --json
+```
+```json
+[
+  {
+    "name": "Maahes HC4",
+    "hash": 1246793994,
+    "owned": 3,
+    "godRolls": 3,
+    "source": "Source: Open Legendary engrams and earn faction rank-up packages.",
+    "instances": [
+      {
+        "instanceId": "6917530071249430515",
+        "gearTier": 0,
+        "level": 1,
+        "location": "vault",
+        "crafted": false,
+        "perks": ["Corkscrew Rifling", "Golden Tricorn", "Unrelenting", "Appended Mag"]
+      }
+    ]
+  }
+]
+```
+
+`godrolls --missing --json` instead returns `{ "name", "hash", "owned", "source", "wants": [[perk, ...], ...] }` per weapon.
+
+Action acks:
+
+```bash
+python bungie.py lock 6917530071249430515 --json     # {"locked": "6917530071249430515"}
+python bungie.py transfer 6917... --to vault --json   # {"transferred": "6917...", "to": "vault"}
+python bungie.py vault --lock-keepers --json
+```
+```json
+{ "total": 216, "keep": 184, "junk": 32, "csv": "dismantle_list.csv",
+  "lockedKeepers": 184, "lockFailures": [] }
+```
+
+A typical agent loop: read state (`inv --json` / `godrolls --json`), decide, act
+(`transfer`/`lock` with `--json`), and check the ack.
+
 ## Notes
 
 - Caches (`manifest_items.json` ~214 MB, `manifest_index.json`, `collectibles.json`, `sources.json`) are built on first use and gitignored.
