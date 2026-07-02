@@ -37,6 +37,44 @@ python bungie.py raw /Any/Platform/Endpoint/ [--post] [--body '{...}']
 python bungie.py selftest                       # offline checks
 ```
 
+## Examples
+
+```bash
+# who am I / my characters
+python bungie.py whoami
+python bungie.py chars
+
+# find a weapon's hash, then where it drops
+python bungie.py item "fatebringer"
+python bungie.py source "fatebringer"
+
+# browse inventory
+python bungie.py inv --vault --type weapon           # weapons in the vault
+python bungie.py inv --search "hung jury"            # anything matching a name
+python bungie.py inv --char 2305843010616664795      # one character's gear
+
+# god rolls you own, and the ones you still need (with drop sources)
+python bungie.py godrolls --source
+python bungie.py godrolls --missing --source
+
+# move / equip / protect a specific item (use an instanceId from `inv`)
+python bungie.py transfer 6917530071249430515 --to char --char 2305843010616664795
+python bungie.py equip 6917530071249430515 --char 2305843010616664795
+python bungie.py lock 6917530071249430515
+
+# empty the postmaster
+python bungie.py postmaster                          # list
+python bungie.py postmaster --pull 6917530071249430515
+
+# vault triage: mark junk vs keepers, lock every keeper, write a shard list
+python bungie.py vault \
+  --wishlist https://raw.githubusercontent.com/48klocs/dim-wish-list-sources/master/voltron.txt \
+  --lock-keepers
+
+# hit any endpoint the CLI doesn't wrap
+python bungie.py raw /Destiny2/3/Profile/4611686018499245344/?components=200
+```
+
 ### God rolls
 
 `godrolls` cross-references the weapons you own against a [DIM voltron wishlist](https://github.com/48klocs/dim-wish-list-sources) (the default) and resolves the winning perks to names:
