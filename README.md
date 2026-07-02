@@ -1,5 +1,10 @@
 # bungie-cli
 
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+![Python](https://img.shields.io/badge/python-3.8%2B-blue.svg)
+![Platform: Bungie.net API](https://img.shields.io/badge/API-Bungie.net-orange.svg)
+![Game: Destiny 2](https://img.shields.io/badge/game-Destiny%202-lightgrey.svg)
+
 A small, extensible command-line interface over the [Bungie.net Platform API](https://bungie-net.github.io/) for Destiny 2 — inventory, god-roll triage against DIM wishlists, item sources, and a raw passthrough to every endpoint.
 
 Two scripts:
