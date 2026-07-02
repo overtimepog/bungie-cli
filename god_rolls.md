@@ -1,7 +1,7 @@
 # Destiny 2 God Rolls — Mid-2026 Meta (Monument of Triumph era)
 
 > The exhaustive per-weapon list is **not** hand-maintained here — it lives in the
-> DIM community wishlist `voltron.txt`, which `vault_clean.py` already consumes:
+> DIM community wishlist `voltron.txt`, which `bungie.py` consumes:
 > `python bungie.py vault --wishlist https://raw.githubusercontent.com/48klocs/dim-wish-list-sources/master/voltron.txt`
 > This file is the *current-meta* layer on top of that: what actually matters now.
 

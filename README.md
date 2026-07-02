@@ -5,11 +5,9 @@
 ![Platform: Bungie.net API](https://img.shields.io/badge/API-Bungie.net-orange.svg)
 ![Game: Destiny 2](https://img.shields.io/badge/game-Destiny%202-lightgrey.svg)
 
-A small, extensible command-line interface over the [Bungie.net Platform API](https://bungie-net.github.io/) for Destiny 2 — inventory, god-roll triage against DIM wishlists, item sources, and a raw passthrough to every endpoint.
+A single, self-contained command-line interface over the [Bungie.net Platform API](https://bungie-net.github.io/) for Destiny 2 — one tool an AI agent (or a human) can drive to inspect and act on an account: characters, inventory, item/source lookup, god-roll triage against DIM wishlists, meta-only vault triage with keeper-locking, transfers/locks/equips, and a raw passthrough to every endpoint.
 
-Two scripts:
-- **`bungie.py`** — the CLI (inventory, god rolls, sources, transfers, locks, raw).
-- **`vault_clean.py`** — ruthless meta-only vault triage: classifies junk against a DIM voltron wishlist and can lock every keeper so a manual dismantle spree can't delete a god roll.
+Everything lives in **`bungie.py`** — no other modules to install or run.
 
 ## Setup
 
@@ -34,7 +32,7 @@ python bungie.py lock|unlock <instanceId>
 python bungie.py transfer <instanceId> --to vault|char [--char ID] [--count N]
 python bungie.py equip <instanceId> --char ID
 python bungie.py postmaster [--char ID] [--pull <instanceId>]
-python bungie.py vault --wishlist <url|file> [--lock-keepers]   # -> vault_clean.py
+python bungie.py vault [--wishlist <url|file>] [--lock-keepers]  # triage -> dismantle_list.csv
 python bungie.py raw /Any/Platform/Endpoint/ [--post] [--body '{...}']
 python bungie.py selftest                       # offline checks
 ```
@@ -59,7 +57,7 @@ python bungie.py raw /Destiny2/Manifest/
 ## Notes
 
 - Caches (`manifest_items.json` ~214 MB, `manifest_index.json`, `collectibles.json`, `sources.json`) are built on first use and gitignored.
-- The Bungie API has **no destroy-item endpoint**, so dismantling stays manual; `vault_clean.py --lock-keepers` makes that manual pass safe.
+- The Bungie API has **no destroy-item endpoint**, so dismantling stays manual; `vault --lock-keepers` locks every keeper first, so a manual dismantle spree can't delete a god roll.
 - Weapon "power" was flattened in the 2026 gear-tier system; the CLI shows `gearTier` + `itemLevel` instead.
 
 ## License

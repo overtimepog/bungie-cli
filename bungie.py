@@ -1,83 +1,206 @@
 #!/usr/bin/env python3
-"""bungie.py - a thin, extensible CLI over the Bungie.net Platform API.
+"""bungie.py - a single, self-contained CLI over the Bungie.net Platform API.
 
-Reuses the proven auth / api / manifest plumbing in vault_clean.py (same folder,
-same app credentials, shared token.json + manifest_items.json caches). The CLI
-chdir's into its own folder so those caches resolve no matter where you run it.
+One tool an agent (or a human) can drive to inspect and act on a user's Destiny 2
+account: characters, inventory, item/source lookup, god-roll matching vs DIM
+wishlists, vault triage with keeper-locking, transfers/locks/equips, and a raw
+passthrough to any endpoint. Chdir's into its own folder so caches resolve
+regardless of the working directory.
+
+Credentials come from a local (gitignored) bungie_secrets.py or env vars
+(BUNGIE_API_KEY / BUNGIE_CLIENT_ID / BUNGIE_CLIENT_SECRET). Token is cached in
+token.json and auto-refreshed. Manifest + collectible tables cache on first use.
 
 Commands:
   login                       force/refresh the OAuth login
   whoami                      current Bungie user + Destiny memberships
   chars                       your characters (class, light, playtime)
   inv [--char ID] [--vault] [--search TERM] [--type weapon|armor]
-                              list instanced items with names + power
+                              list instanced items (gearTier + itemLevel)
   item <name|hash> [-n N]     search the manifest for an item definition
   source <name|hash> [-n N]   where an item drops (collectible source string)
-  lock <instanceId>           lock an item      (unlock: same with unlock)
-  unlock <instanceId>
+  lock <instanceId> / unlock <instanceId>
   transfer <instanceId> --to vault|char [--char ID] [--count N]
   equip <instanceId> --char ID
   postmaster [--char ID] [--pull <instanceId>] [--count N]
-  godrolls [--wishlist SRC] [--search TERM] [--missing]
-                              cross your owned weapons against the DIM voltron
-                              wishlist: which guns you own ARE god rolls (default),
-                              or --missing = own the gun, not the roll
-  vault ...                   delegate to vault_clean.py (its own flags)
+  godrolls [--wishlist SRC] [--search TERM] [--missing] [--source]
+                              cross your owned weapons against a DIM wishlist
+  vault [--wishlist SRC] [--lock-keepers]
+                              meta-only vault triage -> dismantle_list.csv;
+                              --lock-keepers locks every KEEP so a manual
+                              dismantle spree can't delete a god roll
   raw <path> [--post] [--body JSON]
                               call ANY /Platform endpoint (covers the whole API)
   selftest                    offline checks, no network
 
 Per-command help: python bungie.py <command> -h
 """
-import argparse, json, os, subprocess, sys
+import argparse, json, os, sys, time, webbrowser
+from collections import defaultdict
+from urllib.parse import urlencode, urlparse, parse_qs
 import requests
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-os.chdir(HERE)                 # so token.json / manifest_items.json are the folder's
-import vault_clean as vc       # reuse get_token, api, load_manifest, constants
+os.chdir(HERE)                 # so token.json / manifest caches are the folder's
 
-IDX_F     = "manifest_index.json"
-COLL_F    = "collectibles.json"
-SRC_F     = "sources.json"
-VOLTRON   = "https://raw.githubusercontent.com/48klocs/dim-wish-list-sources/master/voltron.txt"
-VAULT_B   = 138197802          # bucketHash for the vault
-POST_B     = 215593132         # bucketHash for a character's postmaster
+# ===== credentials (local bungie_secrets.py, else env; never commit real keys) =====
+try:
+    from bungie_secrets import API_KEY, CLIENT_ID, CLIENT_SECRET
+except ImportError:
+    API_KEY       = os.environ.get("BUNGIE_API_KEY", "")
+    CLIENT_ID     = os.environ.get("BUNGIE_CLIENT_ID", "")
+    CLIENT_SECRET = os.environ.get("BUNGIE_CLIENT_SECRET", "")
+
+BASE         = "https://www.bungie.net/Platform"
+ROOT         = "https://www.bungie.net"
+REDIRECT_URL = "https://localhost:7777/callback"
+TOKENF, MANIF = "token.json", "manifest_items.json"
+IDX_F, COLL_F, SRC_F = "manifest_index.json", "collectibles.json", "sources.json"
+VOLTRON = "https://raw.githubusercontent.com/48klocs/dim-wish-list-sources/master/voltron.txt"
+
+# vault triage tuning (ruthless meta-only defaults)
+KEEP_PER_HASH   = 1     # copies kept of each non-wishlist gun/armor hash
+MIN_ARMOR_TOTAL = 60    # legendary armor under this total stat = junk
+
+ARMOR_STATS = (2996146975, 392767087, 1943323491,    # mob, res, rec
+               1735777505, 144602215, 4244567218)     # dis, int, str
 WEAPON, ARMOR = 3, 2
+WILDCARD  = -69420             # DIM "applies to all items" item id
+VAULT_B   = 138197802         # bucketHash for the vault
+POST_B    = 215593132         # bucketHash for a character's postmaster
 CLASSES   = {0: "Titan", 1: "Hunter", 2: "Warlock", 3: "?"}
 TIERS     = {2: "Basic", 3: "Common", 4: "Rare", 5: "Legendary", 6: "Exotic"}
 
 
-# ===== shared helpers ====================================================
-def membership(token):
-    """Return (membershipType, membershipId) for the primary Destiny account."""
-    me   = vc.api("/User/GetMembershipsForCurrentUser/", token)
-    mems = me["destinyMemberships"]
-    mem  = next((m for m in mems if str(m["membershipId"]) == str(me.get("primaryMembershipId"))),
-                mems[0])
-    return mem["membershipType"], mem["membershipId"]
+# ===== auth =============================================================
+def _save_token(t):
+    t["expires_at"] = time.time() + t.get("expires_in", 3600) - 60
+    json.dump(t, open(TOKENF, "w"))
 
 
-def characters(token, mtype, mid):
-    prof = vc.api(f"/Destiny2/{mtype}/Profile/{mid}/?components=200", token)
-    return prof["characters"]["data"]
+def _exchange(data):
+    # Confidential app: HTTP Basic auth. Public app (no secret): client_id in body.
+    auth = (CLIENT_ID, CLIENT_SECRET) if CLIENT_SECRET else None
+    if not CLIENT_SECRET:
+        data = {**data, "client_id": CLIENT_ID}
+    r = requests.post(f"{BASE}/App/OAuth/Token/", data=data, auth=auth,
+                      headers={"Content-Type": "application/x-www-form-urlencoded"})
+    r.raise_for_status()
+    t = r.json(); _save_token(t); return t
 
 
-def first_char(token, mtype, mid):
-    return next(iter(characters(token, mtype, mid)))
+def _gen_cert():
+    """Self-signed localhost cert to serve the https redirect. Needs cryptography."""
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    import datetime, tempfile
+    key  = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+            .public_key(key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime.utcnow())
+            .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=1))
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), False)
+            .sign(key, hashes.SHA256()))
+    d = tempfile.mkdtemp()
+    cp, kp = os.path.join(d, "c.pem"), os.path.join(d, "k.pem")
+    open(cp, "wb").write(cert.public_bytes(serialization.Encoding.PEM))
+    open(kp, "wb").write(key.private_bytes(serialization.Encoding.PEM,
+        serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()))
+    return cp, kp
+
+
+def _capture_code():
+    """Local https server on the redirect port; return the OAuth code, or None."""
+    try:
+        cp, kp = _gen_cert()
+    except ImportError:
+        return None
+    import ssl
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    box = {}
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            q = parse_qs(urlparse(self.path).query)
+            if "code" in q:
+                box["code"] = q["code"][0]
+                self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
+                self.wfile.write(b"<h2>Login complete. Close this tab and return to the terminal.</h2>")
+            else:
+                self.send_response(204); self.end_headers()
+
+        def log_message(self, *a): pass
+
+    port = urlparse(REDIRECT_URL).port or 443
+    srv  = HTTPServer(("localhost", port), H)
+    ctx  = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(cp, kp)
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    print(f"Waiting for login on {REDIRECT_URL} (accept the browser's cert warning)...")
+    while "code" not in box:
+        srv.handle_request()
+    return box["code"]
+
+
+def get_token():
+    if os.path.exists(TOKENF):
+        t = json.load(open(TOKENF))
+        if t.get("expires_at", 0) > time.time():
+            return t["access_token"]
+        if t.get("refresh_token"):
+            try:
+                return _exchange({"grant_type": "refresh_token",
+                                  "refresh_token": t["refresh_token"]})["access_token"]
+            except Exception:
+                pass
+    url = "https://www.bungie.net/en/OAuth/Authorize?" + urlencode(
+        {"client_id": CLIENT_ID, "response_type": "code"})
+    print("\nApprove access here:\n", url, "\n")
+    try: webbrowser.open(url)
+    except Exception: pass
+    code = _capture_code()
+    if not code:
+        raw  = input("Paste the code (or full localhost URL): ").strip()
+        code = parse_qs(urlparse(raw).query).get("code", [raw])[0]
+    return _exchange({"grant_type": "authorization_code", "code": code})["access_token"]
+
+
+def api(path, token=None, method="GET", json_body=None):
+    h = {"X-API-Key": API_KEY}
+    if token: h["Authorization"] = f"Bearer {token}"
+    r = requests.request(method, f"{BASE}{path}", headers=h, json=json_body)
+    r.raise_for_status()
+    body = r.json()
+    if body.get("ErrorCode", 1) != 1:
+        raise RuntimeError(f"{body.get('ErrorStatus')}: {body.get('Message')}")
+    return body["Response"]
+
+
+# ===== manifest + caches ================================================
+def load_manifest():
+    if os.path.exists(MANIF):
+        return json.load(open(MANIF))
+    print("downloading item manifest (~once)...")
+    m    = api("/Destiny2/Manifest/")
+    path = m["jsonWorldComponentContentPaths"]["en"]["DestinyInventoryItemDefinition"]
+    defs = requests.get(ROOT + path).json()
+    json.dump(defs, open(MANIF, "w"))
+    return defs
 
 
 def index():
-    """Slim {hash: {name, type, tier}} map. Built once from the 214MB manifest,
-    then cached small so name lookups are cheap.
+    """Slim {hash: {name, type, tier}} map. Built once from the manifest, cached.
     ponytail: JSON scan; move to the SQLite manifest if lookups get hot."""
     if os.path.exists(IDX_F):
         return json.load(open(IDX_F, encoding="utf-8"))
-    defs = vc.load_manifest()
+    defs = load_manifest()
     idx  = {h: {"name": d["displayProperties"]["name"],
                 "type": d.get("itemType", 0),
                 "tier": d.get("inventory", {}).get("tierType", 0)}
-            for h, d in defs.items()
-            if d.get("displayProperties", {}).get("name")}
+           for h, d in defs.items()
+           if d.get("displayProperties", {}).get("name")}
     json.dump(idx, open(IDX_F, "w", encoding="utf-8"))
     return idx
 
@@ -85,10 +208,10 @@ def index():
 def collectibles():
     if os.path.exists(COLL_F):
         return json.load(open(COLL_F, encoding="utf-8"))
-    m    = vc.api("/Destiny2/Manifest/")            # public, no token needed
+    m    = api("/Destiny2/Manifest/")               # public, no token needed
     path = m["jsonWorldComponentContentPaths"]["en"]["DestinyCollectibleDefinition"]
     print("downloading collectible defs (~once)...")
-    c    = requests.get(vc.ROOT + path).json()
+    c    = requests.get(ROOT + path).json()
     json.dump(c, open(COLL_F, "w", encoding="utf-8"))
     return c
 
@@ -97,7 +220,7 @@ def sources():
     """Slim {itemHash: sourceString}. Built once from full manifest + collectibles."""
     if os.path.exists(SRC_F):
         return json.load(open(SRC_F, encoding="utf-8"))
-    defs, coll = vc.load_manifest(), collectibles()
+    defs, coll = load_manifest(), collectibles()
     out = {}
     for h, d in defs.items():
         ch = d.get("collectibleHash")
@@ -119,10 +242,93 @@ def search_defs(idx, term, n=15):
     return hits[:n]
 
 
+# ===== wishlist (DIM voltron format) ====================================
+def load_wishlist(src):
+    """src = file path or URL. Returns {item_hash: [frozenset(required perks), ...]}."""
+    text = requests.get(src).text if src.startswith("http") else open(src, encoding="utf-8").read()
+    wl = defaultdict(list)
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("dimwishlist:"):
+            continue
+        params = dict(p.split("=", 1) for p in line[len("dimwishlist:"):].split("&") if "=" in p)
+        try:
+            ih = int(params.get("item", "0"))
+        except ValueError:
+            continue
+        if ih < 0 and ih != WILDCARD:
+            continue                                   # negative = trash roll; we only whitelist
+        perks = frozenset(int(x) for x in params.get("perks", "").split(",") if x.strip().lstrip("-").isdigit())
+        wl[ih].append(perks)
+    return dict(wl)
+
+
+def matched_set(it, wl):
+    """The wishlist perk-set this instance satisfies, or None."""
+    for req in wl.get(it["hash"], ()):                 # empty req (item-only line) matches any roll
+        if req <= it["perks"]:
+            return req
+    for req in wl.get(WILDCARD, ()):                   # wildcard must name perks
+        if req and req <= it["perks"]:
+            return req
+    return None
+
+
+# ===== vault triage rules (pure, testable, no network) ==================
+def classify(items, wishlist=None, keep_per_hash=KEEP_PER_HASH, min_armor_total=MIN_ARMOR_TOTAL):
+    wl_on = wishlist is not None
+    for it in items:                                   # crafted weapons are protected like wishlist rolls
+        it["verdict"], it["reason"] = "keep", ""
+        it["wl"] = it.get("crafted", False) or (matched_set(it, wishlist) is not None if wl_on else False)
+
+    for it in items:                                   # greens + blues
+        if it["tierType"] <= 4:
+            it["verdict"], it["reason"] = "junk", "rare or below"
+
+    for it in items:                                   # weak legendary armor (wishlist match spared)
+        if (it["verdict"] == "keep" and not it["wl"] and it["itemType"] == ARMOR
+                and it["tierType"] == 5 and it["total"] < min_armor_total):
+            it["verdict"], it["reason"] = "junk", f"armor total {it['total']} < {min_armor_total}"
+
+    if wl_on:                                           # meta gate: non-wishlist LEGENDARY weapons are junk
+        for it in items:                               # exotics are build-defining -> never gated
+            if (it["verdict"] == "keep" and it["itemType"] == WEAPON
+                    and it["tierType"] == 5 and not it["wl"]):
+                it["verdict"], it["reason"] = "junk", "not a wishlist roll"
+
+    groups = defaultdict(list)                          # dupes among survivors (wishlist rolls exempt)
+    for it in items:
+        if it["verdict"] == "keep" and not it["wl"] and it["itemType"] in (WEAPON, ARMOR):
+            groups[it["hash"]].append(it)
+    for grp in groups.values():                         # keep the best copy (gearTier > level > power)
+        grp.sort(key=lambda x: (x.get("gearTier", 0), x.get("level", 0), x.get("power", 0)), reverse=True)
+        for extra in grp[keep_per_hash:]:
+            extra["verdict"], extra["reason"] = "junk", "duplicate (lower tier)"
+    return items
+
+
+# ===== account / inventory ==============================================
+def membership(token):
+    """(membershipType, membershipId) for the primary Destiny account."""
+    me   = api("/User/GetMembershipsForCurrentUser/", token)
+    mems = me["destinyMemberships"]
+    mem  = next((m for m in mems if str(m["membershipId"]) == str(me.get("primaryMembershipId"))),
+                mems[0])
+    return mem["membershipType"], mem["membershipId"]
+
+
+def characters(token, mtype, mid):
+    prof = api(f"/Destiny2/{mtype}/Profile/{mid}/?components=200", token)
+    return prof["characters"]["data"]
+
+
+def first_char(token, mtype, mid):
+    return next(iter(characters(token, mtype, mid)))
+
+
 def all_items(token, mtype, mid, comps="102,201,205,300"):
-    """Yield (item_dict, owner) across vault + every character inv/equipment.
-    owner is 'vault' or a characterId. Returns (list, instances_comp)."""
-    prof = vc.api(f"/Destiny2/{mtype}/Profile/{mid}/?components={comps}", token)
+    """(list of (item, owner), instances_comp). owner is 'vault' or a characterId."""
+    prof = api(f"/Destiny2/{mtype}/Profile/{mid}/?components={comps}", token)
     inst = prof.get("itemComponents", {}).get("instances", {}).get("data", {})
     out  = [(it, "vault") for it in prof["profileInventory"]["data"]["items"]]
     for cid, inv in prof.get("characterInventories", {}).get("data", {}).items():
@@ -141,15 +347,72 @@ def find_instance(token, mtype, mid, iid):
     sys.exit(f"instance {iid} not found in your inventory")
 
 
-# ===== commands ==========================================================
+def build_inventory(token, defs):
+    """Weapons + armor across vault and characters, with perks/stats resolved.
+    Returns (items, membershipType, char_id). char_id = any character, for locking."""
+    mtype, mid = membership(token)
+    prof = api(f"/Destiny2/{mtype}/Profile/{mid}/?components=102,200,201,300,304,305", token)
+    char_id = next(iter(prof["characters"]["data"]))
+    comp = prof.get("itemComponents", {})
+    inst = comp.get("instances", {}).get("data", {})
+    stat = comp.get("stats", {}).get("data", {})
+    sock = comp.get("sockets", {}).get("data", {})
+
+    raw = [(it, char_id) for it in prof["profileInventory"]["data"]["items"]]
+    for cid, items in prof["characterInventories"]["data"].items():
+        raw += [(it, cid) for it in items["items"]]
+
+    out = []
+    for it, owner in raw:
+        iid = it.get("itemInstanceId")
+        if not iid:
+            continue
+        d = defs.get(str(it["itemHash"]))
+        if not d or d.get("itemType", 0) not in (WEAPON, ARMOR):
+            continue
+        total = sum(s["value"] for h, s in stat.get(iid, {}).get("stats", {}).items()
+                    if int(h) in ARMOR_STATS)
+        perks = frozenset(s["plugHash"] for s in sock.get(iid, {}).get("sockets", [])
+                          if s.get("plugHash"))
+        d_inst = inst.get(iid, {})
+        out.append(dict(
+            hash=it["itemHash"],
+            name=d["displayProperties"]["name"],
+            itemType=d["itemType"],
+            tierType=d.get("inventory", {}).get("tierType", 0),
+            power=d_inst.get("primaryStat", {}).get("value", 0),
+            gearTier=d_inst.get("gearTier", 0),          # 2026 Frontiers quality tier (0-5)
+            level=d_inst.get("itemLevel", 0),            # weapon power was flattened; itemLevel is meaningful
+            total=total,
+            perks=perks,
+            crafted=bool(it.get("state", 0) & 8),        # DestinyItemState.Crafted
+            instanceId=iid,
+            owner=owner,                                 # character id to lock this item through
+            location="vault" if it.get("bucketHash") == VAULT_B else "char",
+        ))
+    return out, mtype, char_id
+
+
+def set_lock(token, mtype, char, iid, state):
+    api("/Destiny2/Actions/Items/SetLockState/", token, "POST",
+        {"state": state, "itemId": iid, "characterId": char, "membershipType": mtype})
+
+
+def _perk_names(defs, hashes, cap=4):
+    names = [defs.get(str(h), {}).get("displayProperties", {}).get("name", "") for h in hashes]
+    names = [n for n in names if n]
+    return ", ".join(names[:cap]) + (" ..." if len(names) > cap else "")
+
+
+# ===== commands =========================================================
 def cmd_login(a):
-    vc.get_token()
+    get_token()
     print("logged in; token cached in token.json")
 
 
 def cmd_whoami(a):
-    token = vc.get_token()
-    me = vc.api("/User/GetMembershipsForCurrentUser/", token)
+    token = get_token()
+    me = api("/User/GetMembershipsForCurrentUser/", token)
     u  = me.get("bungieNetUser", {})
     print(f"{u.get('uniqueName', u.get('displayName','?'))}  (membershipId {u.get('membershipId','?')})")
     for m in me["destinyMemberships"]:
@@ -158,7 +421,7 @@ def cmd_whoami(a):
 
 
 def cmd_chars(a):
-    token = vc.get_token()
+    token = get_token()
     mtype, mid = membership(token)
     for cid, c in characters(token, mtype, mid).items():
         print(f"{cid}  {CLASSES.get(c['classType'],'?'):7}  light {c.get('light','?'):>4}  "
@@ -166,7 +429,7 @@ def cmd_chars(a):
 
 
 def cmd_inv(a):
-    token = vc.get_token()
+    token = get_token()
     mtype, mid = membership(token)
     idx = index()
     items, inst = all_items(token, mtype, mid)
@@ -184,9 +447,8 @@ def cmd_inv(a):
         if a.type == "armor"  and info["type"] != ARMOR:  continue
         if a.search and a.search.lower() not in info["name"].lower(): continue
         d     = inst.get(iid, {})
-        level = d.get("itemLevel", 0)
-        gt    = d.get("gearTier", 0)
-        rows.append((info["name"], level, gt, TIERS.get(info["tier"], "?"),
+        rows.append((info["name"], d.get("itemLevel", 0), d.get("gearTier", 0),
+                     TIERS.get(info["tier"], "?"),
                      "vault" if owner == "vault" else owner[-6:], iid))
     rows.sort(key=lambda r: (-r[1], r[0]))
     for name, level, gt, tier, loc, iid in rows:
@@ -203,63 +465,6 @@ def cmd_item(a):
         print("no match")
 
 
-def _set_lock(token, state, iid):
-    mtype, mid = membership(token)
-    char = first_char(token, mtype, mid)
-    vc.api("/Destiny2/Actions/Items/SetLockState/", token, "POST",
-           {"state": state, "itemId": iid, "characterId": char, "membershipType": mtype})
-    print(f"{'locked' if state else 'unlocked'} {iid}")
-
-
-def cmd_lock(a):   _set_lock(vc.get_token(), True,  a.instance)
-def cmd_unlock(a): _set_lock(vc.get_token(), False, a.instance)
-
-
-def cmd_transfer(a):
-    token = vc.get_token()
-    mtype, mid = membership(token)
-    ih, owner = find_instance(token, mtype, mid, a.instance)
-    if a.to == "vault":
-        if owner == "vault":
-            return print("already in vault")
-        cid, to_vault = owner, True
-    else:
-        cid, to_vault = a.char or first_char(token, mtype, mid), False
-    vc.api("/Destiny2/Actions/Items/TransferItem/", token, "POST",
-           {"itemReferenceHash": ih, "stackSize": a.count, "transferToVault": to_vault,
-            "itemId": a.instance, "characterId": cid, "membershipType": mtype})
-    print(f"transferred {a.instance} -> {a.to}")
-    # ponytail: char->char must hop through the vault; run twice if that's what you need.
-
-
-def cmd_equip(a):
-    token = vc.get_token()
-    mtype, _ = membership(token)
-    vc.api("/Destiny2/Actions/Items/EquipItem/", token, "POST",
-           {"itemId": a.instance, "characterId": a.char, "membershipType": mtype})
-    print(f"equipped {a.instance} on {a.char}")
-
-
-def cmd_postmaster(a):
-    token = vc.get_token()
-    mtype, mid = membership(token)
-    idx = index()
-    if a.pull:
-        ih, owner = find_instance(token, mtype, mid, a.pull)
-        vc.api("/Destiny2/Actions/Items/PullFromPostmaster/", token, "POST",
-               {"itemReferenceHash": ih, "stackSize": a.count, "itemId": a.pull,
-                "characterId": owner, "membershipType": mtype})
-        return print(f"pulled {a.pull}")
-    items, inst = all_items(token, mtype, mid, comps="201,300")
-    for it, owner in items:
-        if it.get("bucketHash") != POST_B:            continue
-        if a.char and owner != a.char:                continue
-        info = idx.get(str(it["itemHash"]), {"name": f"hash {it['itemHash']}"})
-        iid  = it.get("itemInstanceId", "-")
-        qty  = it.get("quantity", 1)
-        print(f"{owner[-6:]}  x{qty:<3}  {info['name']:38.38}  {iid}")
-
-
 def cmd_source(a):
     idx, srcs = index(), sources()
     seen = {}                                   # name -> best source (a real one wins over blank)
@@ -273,31 +478,68 @@ def cmd_source(a):
         print("no match")
 
 
-def _perk_names(defs, hashes, cap=4):
-    names = [defs.get(str(h), {}).get("displayProperties", {}).get("name", "") for h in hashes]
-    names = [n for n in names if n]
-    return ", ".join(names[:cap]) + (" ..." if len(names) > cap else "")
+def cmd_lock(a):
+    token = get_token(); mtype, mid = membership(token)
+    set_lock(token, mtype, first_char(token, mtype, mid), a.instance, True)
+    print(f"locked {a.instance}")
 
 
-def _matched(it, wl):
-    """The wishlist perk-set this instance satisfies, or None. Mirrors vault_clean.matches_wishlist."""
-    for req in wl.get(it["hash"], ()):
-        if req <= it["perks"]:
-            return req
-    for req in wl.get(vc.WILDCARD, ()):
-        if req and req <= it["perks"]:
-            return req
-    return None
+def cmd_unlock(a):
+    token = get_token(); mtype, mid = membership(token)
+    set_lock(token, mtype, first_char(token, mtype, mid), a.instance, False)
+    print(f"unlocked {a.instance}")
+
+
+def cmd_transfer(a):
+    token = get_token()
+    mtype, mid = membership(token)
+    ih, owner = find_instance(token, mtype, mid, a.instance)
+    if a.to == "vault":
+        if owner == "vault":
+            return print("already in vault")
+        cid, to_vault = owner, True
+    else:
+        cid, to_vault = a.char or first_char(token, mtype, mid), False
+    api("/Destiny2/Actions/Items/TransferItem/", token, "POST",
+        {"itemReferenceHash": ih, "stackSize": a.count, "transferToVault": to_vault,
+         "itemId": a.instance, "characterId": cid, "membershipType": mtype})
+    print(f"transferred {a.instance} -> {a.to}")
+    # ponytail: char->char must hop through the vault; run twice if that's what you need.
+
+
+def cmd_equip(a):
+    token = get_token()
+    mtype, _ = membership(token)
+    api("/Destiny2/Actions/Items/EquipItem/", token, "POST",
+        {"itemId": a.instance, "characterId": a.char, "membershipType": mtype})
+    print(f"equipped {a.instance} on {a.char}")
+
+
+def cmd_postmaster(a):
+    token = get_token()
+    mtype, mid = membership(token)
+    idx = index()
+    if a.pull:
+        ih, owner = find_instance(token, mtype, mid, a.pull)
+        api("/Destiny2/Actions/Items/PullFromPostmaster/", token, "POST",
+            {"itemReferenceHash": ih, "stackSize": a.count, "itemId": a.pull,
+             "characterId": owner, "membershipType": mtype})
+        return print(f"pulled {a.pull}")
+    items, _ = all_items(token, mtype, mid, comps="201,300")
+    for it, owner in items:
+        if it.get("bucketHash") != POST_B:            continue
+        if a.char and owner != a.char:                continue
+        info = idx.get(str(it["itemHash"]), {"name": f"hash {it['itemHash']}"})
+        print(f"{owner[-6:]}  x{it.get('quantity',1):<3}  {info['name']:38.38}  {it.get('itemInstanceId','-')}")
 
 
 def cmd_godrolls(a):
-    from collections import defaultdict
-    token = vc.get_token()
-    wl    = vc.load_wishlist(a.wishlist)
+    token = get_token()
+    wl    = load_wishlist(a.wishlist)
     print(f"wishlist: {len(wl)} entries")
-    defs  = vc.load_manifest()
+    defs  = load_manifest()
     srcs  = sources() if a.source else {}
-    items, _, _ = vc.build_inventory(token, defs)
+    items, _, _ = build_inventory(token, defs)
     guns  = [it for it in items if it["itemType"] == WEAPON
              and (not a.search or a.search.lower() in it["name"].lower())]
     byhash = defaultdict(list)
@@ -307,7 +549,7 @@ def cmd_godrolls(a):
     hits = miss = 0
     for h, grp in sorted(byhash.items(), key=lambda kv: kv[1][0]["name"].lower()):
         name    = grp[0]["name"]
-        matched = [(it, _matched(it, wl)) for it in grp]
+        matched = [(it, matched_set(it, wl)) for it in grp]
         good    = [(it, req) for it, req in matched if req is not None or it.get("crafted")]
         if a.missing:
             if good or h not in wl:
@@ -323,26 +565,58 @@ def cmd_godrolls(a):
         print(f"{name:34.34} x{len(grp)} owned, {len(good)} god roll{src}")
         for it, req in good:
             tag  = "crafted" if (it.get("crafted") and req is None) else _perk_names(defs, req or [])
-            meta = f"T{it['gearTier']} L{it['level']}"
-            print(f"   {meta:>7}  {it['location']:>5}  {it['instanceId']}  {tag}")
+            print(f"   T{it['gearTier']} L{it['level']:<3}  {it['location']:>5}  {it['instanceId']}  {tag}")
             hits += 1
     print(f"\n{'missing ' + str(miss) if a.missing else str(hits) + ' god-roll instances'}")
 
 
 def cmd_vault(a):
-    subprocess.run([sys.executable, os.path.join(HERE, "vault_clean.py"), *a.rest], cwd=HERE)
+    """Meta-only triage -> dismantle_list.csv; optionally lock every keeper."""
+    wishlist = load_wishlist(a.wishlist) if a.wishlist else None
+    if wishlist is not None:
+        print(f"wishlist: {len(wishlist)} entries")
+    token = get_token()
+    defs  = load_manifest()
+    items, mtype, _ = build_inventory(token, defs)
+    classify(items, wishlist=wishlist)
+    junk = [it for it in items if it["verdict"] == "junk"]
+    keep = [it for it in items if it["verdict"] == "keep"]
+    junk.sort(key=lambda x: (x["itemType"], x["reason"], -x["level"]))
+
+    with open("dismantle_list.csv", "w", encoding="utf-8") as f:
+        f.write("name,type,gearTier,level,total,location,reason\n")
+        for it in junk:
+            t = "weapon" if it["itemType"] == WEAPON else "armor"
+            f.write(f"\"{it['name']}\",{t},{it['gearTier']},{it['level']},"
+                    f"{it['total']},{it['location']},\"{it['reason']}\"\n")
+
+    print(f"\n{len(items)} instanced items  |  KEEP {len(keep)}  |  JUNK {len(junk)}")
+    print("wrote dismantle_list.csv")
+
+    if a.lock_keepers:
+        print(f"locking {len(keep)} keepers...")
+        for i, it in enumerate(keep, 1):
+            try:
+                set_lock(token, mtype, it["owner"], it["instanceId"], True)
+            except Exception as e:
+                print(f"  lock failed {it['name']}: {e}")
+            time.sleep(0.15)            # ponytail: fixed throttle; raise if Bungie 429s
+            if i % 25 == 0:
+                print(f"  {i}/{len(keep)}")
+        print("keepers locked. Now shard the dismantle_list safely.")
 
 
 def cmd_raw(a):
-    token  = vc.get_token()
+    token  = get_token()
     body   = json.loads(a.body) if a.body else None
     method = "POST" if (a.post or body) else "GET"
-    out    = vc.api(a.path, token, method, body)
+    out    = api(a.path, token, method, body)
     text   = json.dumps(out, indent=2)
     print(text[:20000] + ("\n... (truncated)" if len(text) > 20000 else ""))
 
 
 def cmd_selftest(a):
+    # --- CLI helpers: search + wishlist matching ---
     idx = {"1": {"name": "Fatebringer", "type": WEAPON, "tier": 5},
            "2": {"name": "Fate of All Fools", "type": WEAPON, "tier": 6},
            "3": {"name": "Chromatic Fire", "type": ARMOR, "tier": 6}}
@@ -350,16 +624,43 @@ def cmd_selftest(a):
     assert [h for h, _ in search_defs(idx, "2")] == ["2"], "exact-hash lookup"
     assert search_defs(idx, "nope") == [], "no match"
     assert CLASSES[1] == "Hunter" and TIERS[6] == "Exotic"
-    wl = {5: [frozenset({11, 22})], vc.WILDCARD: [frozenset({99})]}
-    assert _matched({"hash": 5, "perks": frozenset({11, 22, 33})}, wl) == frozenset({11, 22})
-    assert _matched({"hash": 5, "perks": frozenset({11})}, wl) is None
-    assert _matched({"hash": 7, "perks": frozenset({99})}, wl) == frozenset({99})
+    wl = {5: [frozenset({11, 22})], WILDCARD: [frozenset({99})]}
+    assert matched_set({"hash": 5, "perks": frozenset({11, 22, 33})}, wl) == frozenset({11, 22})
+    assert matched_set({"hash": 5, "perks": frozenset({11})}, wl) is None
+    assert matched_set({"hash": 7, "perks": frozenset({99})}, wl) == frozenset({99})
+
+    # --- vault triage rules ---
+    base = lambda **k: {"total": 0, "power": 0, "level": 0, "gearTier": 0, "perks": frozenset(), **k}
+    items = [
+        base(hash=1, name="Blue",  itemType=WEAPON, tierType=4, power=1800, instanceId="a"),
+        base(hash=2, name="Dupe+", itemType=WEAPON, tierType=5, power=2000, instanceId="b"),
+        base(hash=2, name="Dupe-", itemType=WEAPON, tierType=5, power=1900, instanceId="c"),
+        base(hash=3, name="LowArm", itemType=ARMOR, tierType=5, power=2000, total=55, instanceId="d"),
+        base(hash=4, name="OKArm",  itemType=ARMOR, tierType=5, power=2000, total=66, instanceId="e"),
+        base(hash=5, name="Exotic", itemType=ARMOR, tierType=6, power=2000, total=58, instanceId="f"),
+    ]
+    v = {x["instanceId"]: x["verdict"] for x in classify(items)}
+    assert v == dict(a="junk", b="keep", c="junk", d="junk", e="keep", f="keep"), v
+
+    wl2 = {100: [frozenset({11, 22})], WILDCARD: [frozenset({99})]}
+    items = [
+        base(hash=100, name="GodRoll", itemType=WEAPON, tierType=5, perks=frozenset({11, 22, 33}), instanceId="g"),
+        base(hash=100, name="GodDupe", itemType=WEAPON, tierType=5, perks=frozenset({11, 22}),     instanceId="h"),
+        base(hash=100, name="BadRoll", itemType=WEAPON, tierType=5, perks=frozenset({11}),         instanceId="i"),
+        base(hash=200, name="Wildcard", itemType=WEAPON, tierType=5, perks=frozenset({99}),        instanceId="j"),
+        base(hash=300, name="NoMatch", itemType=WEAPON, tierType=5, perks=frozenset(),             instanceId="k"),
+        base(hash=400, name="Blue",    itemType=WEAPON, tierType=4, perks=frozenset({11, 22}),     instanceId="l"),
+        base(hash=500, name="Exotic",  itemType=WEAPON, tierType=6, perks=frozenset(),             instanceId="m"),
+        base(hash=600, name="Crafted", itemType=WEAPON, tierType=5, perks=frozenset(), crafted=True, instanceId="n"),
+    ]
+    v = {x["instanceId"]: x["verdict"] for x in classify(items, wishlist=wl2)}
+    assert v == dict(g="keep", h="keep", i="junk", j="keep", k="junk", l="junk", m="keep", n="keep"), v
     print("selftest ok")
 
 
-# ===== dispatch ==========================================================
+# ===== dispatch =========================================================
 def main():
-    ap  = argparse.ArgumentParser(description="CLI over the Bungie.net Platform API")
+    ap  = argparse.ArgumentParser(description="Single CLI over the Bungie.net Platform API")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("login").set_defaults(fn=cmd_login)
@@ -395,12 +696,16 @@ def main():
     p.add_argument("--missing", action="store_true"); p.add_argument("--source", action="store_true")
 
     p = sub.add_parser("vault"); p.set_defaults(fn=cmd_vault)
-    p.add_argument("rest", nargs=argparse.REMAINDER)
+    p.add_argument("--wishlist", help="DIM voltron file/URL; enables the meta gate")
+    p.add_argument("--lock-keepers", action="store_true")
 
     p = sub.add_parser("raw"); p.set_defaults(fn=cmd_raw)
     p.add_argument("path"); p.add_argument("--post", action="store_true"); p.add_argument("--body")
 
     a = ap.parse_args()
+    if a.cmd != "selftest" and not API_KEY:
+        sys.exit("No API key. Copy bungie_secrets.example.py -> bungie_secrets.py and fill it in "
+                 "(or set BUNGIE_API_KEY / BUNGIE_CLIENT_ID).")
     a.fn(a)
 
 
